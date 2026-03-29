@@ -19,6 +19,7 @@ A minimalist terminal-based MP3 music player built with Rust.
 - **Keyboard-Driven**: Lightning-fast keyboard-only interface
 - **Fuzzy Search**: Real-time search with `/` key - find songs instantly
 - **Vim-Style Navigation**: Full vim keybinding support (hjkl, gg/G, n/N, q)
+- **Pitch-Preserving Speed Control**: Speed up or slow down playback without chipmunk/horror voice effects (custom WSOLA algorithm)
 
 ## Quick Start
 
@@ -31,7 +32,7 @@ A minimalist terminal-based MP3 music player built with Rust.
 
 ```bash
 # Clone the repository
-git clone git@github.com:coolcode/musix.git
+git clone git@github.com:isa/musix.git
 cd musix
 
 # Build and run
@@ -43,31 +44,25 @@ cargo build --release
 ```
 
 ### Quick Usage
-1. **Start the player**: `cargo run`
+1. **Start the player**: `cargo run -- /path/to/music` or just `cargo run` to use current directory
 2. **Navigate**: Use `j/k` or arrow keys to browse songs
 3. **Search**: Press `/` and type to find songs instantly
 4. **Play**: Press `Enter` or `Space` to play selected song
-5. **Jump**: Use `gg` (first song) or `G` (last song)
-6. **Help**: Press `x` to see all controls
-7. **Quit**: Press `q` or `Esc` to exit
+5. **Speed up**: Press `+`/`-` to adjust playback speed
+6. **Jump**: Use `gg` (first song) or `G` (last song)
+7. **Help**: Press `x` to see all controls
+8. **Quit**: Press `q` or `Esc` to exit
 
-### Setup Music Files
+### Music Files
 
-MUSIX automatically searches for MP3 files in these directories:
-
-1. **`~/Music`** - Your system's Music directory
-2. **`./data`** - Local data folder
+MUSIX scans for MP3 files recursively:
 
 ```bash
-# Option 1: Use local data folder
-mkdir -p ./data
-cp /path/to/your/music/*.mp3 ./data/
+# Play from a specific folder
+musix /path/to/music
 
-# Option 2: Use system Music directory
-cp /path/to/your/music/*.mp3 ~/Music/
-
-# Option 3: Create symbolic link
-ln -s /path/to/your/music ./data
+# Play from current directory (default)
+musix
 ```
 
 ## Controls
@@ -93,6 +88,8 @@ ln -s /path/to/your/music ./data
 | `gg` / `G` | Jump to first/last song |
 | `,` / `.` | Seek backward/forward 5 seconds |
 | `<` / `>` | Same as above |
+| `+` / `-` | Increase/decrease playback speed (±0.1x) |
+| `=` | Reset speed to 1.0x |
 | `r` | Toggle Random mode |
 
 ### Search Mode
@@ -140,6 +137,8 @@ MUSIX features a clean, 4-panel interface that maximizes space for your music:
 │ /          - Enter search mode  │
 │ n/N        - Next/prev search   │
 │ ,/.        - Seek ±5 seconds    │
+│ +/-        - Speed up/down      │
+│ =          - Reset speed (1.0x) │
 │ r          - Toggle random mode │
 │ q/Esc      - Exit application   │
 │ x          - Close this popup   │
@@ -157,6 +156,12 @@ MUSIX features a clean, 4-panel interface that maximizes space for your music:
 - **Quick Play**: Press Enter on any result to play immediately
 
 **Example**: Searching "btl" will match "Battle Song", "Beautiful", "Subtitle"
+
+### Playback Speed Control
+- **Pitch-Preserving**: Speed changes use a custom WSOLA algorithm — voice sounds natural at any speed
+- **Range**: 0.25x to 4.0x in 0.1x increments
+- **Quick Reset**: Press `=` to instantly return to normal speed
+- **Status Display**: Current speed shown in the status bar (e.g., "Speed: 1.50x")
 
 ### Visual Indicators
 - **`→`** Currently selected song in the list
@@ -192,7 +197,6 @@ MUSIX features a clean, 4-panel interface that maximizes space for your music:
 - **`rodio`** - Professional audio playback and MP3 decoding
 - **`ratatui`** - Modern terminal user interface framework
 - **`crossterm`** - Cross-platform terminal control
-- **`rand`** - Cryptographically secure random shuffle
 
 ## Development
 
@@ -201,7 +205,7 @@ MUSIX features a clean, 4-panel interface that maximizes space for your music:
 ```
 musix/
 ├── src/
-│   └── main.rs          # Complete application (~700 lines)
+│   └── main.rs          # Complete application (~1600 lines)
 ├── data/                # MP3 files (optional)
 ├── .github/workflows/   # CI/CD automation
 ├── Cargo.toml          # Dependencies and metadata
@@ -230,32 +234,16 @@ cargo fmt --all -- --check
 
 ### No Music Files Found
 
-**Issue**: `No MP3 files found in any accessible directory`
+**Issue**: `No MP3 files found`
 
 **Solutions**:
 ```bash
-# Option 1: Copy files to data folder
-mkdir -p ./data
-cp /path/to/your/music/*.mp3 ./data/
+# Specify a directory containing MP3 files
+musix /path/to/your/music
 
-# Option 2: Create symbolic link
-ln -s /path/to/your/music ./data
-
-# Option 3: Check permissions
-ls -la ~/Music
+# Or run from a directory that has MP3 files
+cd /path/to/your/music && musix
 ```
-
-### macOS Music Access
-
-**Issue**: Cannot access ~/Music directory on macOS
-
-**Solution**: Enable Full Disk Access for your terminal:
-
-1. **System Settings** → **Privacy & Security** → **Full Disk Access**
-2. Click lock icon to unlock settings
-3. Click **+** and add your terminal app (Terminal/iTerm2)
-4. Enable the checkbox
-5. **Restart your terminal**
 
 ### Linux Audio Issues
 
