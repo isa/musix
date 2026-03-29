@@ -20,7 +20,109 @@ use ratatui::{
     widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph},
 };
 use rodio::{Decoder, OutputStream, Sink, Source};
-use timestretch::{StretchParams, stretch, QualityMode};
+
+/// Simple WSOLA (Waveform Similarity Overlap-Add) time-stretcher.
+/// Changes playback speed without altering pitch. No FFT, no phase vocoder —
+/// just windowed overlap-add with best-correlation search for clean results.
+fn time_stretch_wsola(samples: &[f32], channels: u16, rate: f32) -> Vec<f32> {
+    let ch = channels as usize;
+    if ch == 0 || samples.is_empty() || (rate - 1.0).abs() < 0.001 {
+        return samples.to_vec();
+    }
+
+    let total_frames = samples.len() / ch;
+    let segment_frames = 1024; // ~23ms at 44100 Hz
+    let hop_out_frames = segment_frames / 2;
+    let hop_in_frames = ((hop_out_frames as f64) * rate as f64) as usize;
+    let search_frames = 128; // search range for best overlap
+
+    if hop_in_frames == 0 || total_frames < segment_frames {
+        return samples.to_vec();
+    }
+
+    // Hann window
+    let window: Vec<f32> = (0..segment_frames)
+        .map(|i| {
+            0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / segment_frames as f32).cos())
+        })
+        .collect();
+
+    let output_frames = (total_frames as f64 / rate as f64) as usize + segment_frames;
+    let mut output = vec![0.0f32; output_frames * ch];
+    let mut norm = vec![0.0f32; output_frames]; // normalization weights per frame
+
+    let mut in_frame: usize = 0;
+    let mut out_frame: usize = 0;
+
+    while in_frame + segment_frames <= total_frames && out_frame + segment_frames <= output_frames {
+        // WSOLA: find best offset within search range by cross-correlation
+        let best_offset = if out_frame >= hop_out_frames && in_frame > 0 {
+            let mut best = 0i32;
+            let mut best_corr = f32::NEG_INFINITY;
+            let range = search_frames as i32;
+
+            for offset in -range..=range {
+                let candidate = in_frame as i32 + offset;
+                if candidate < 0 || (candidate as usize + segment_frames) > total_frames {
+                    continue;
+                }
+                // Compute correlation over overlap region (first hop_out_frames)
+                let mut corr = 0.0f32;
+                let overlap_end = out_frame.min(output_frames);
+                let overlap_start = out_frame.saturating_sub(hop_out_frames);
+                let overlap_len = overlap_end - overlap_start;
+                for f in 0..overlap_len.min(hop_out_frames) {
+                    let out_idx = overlap_start + f;
+                    if out_idx < output_frames && norm[out_idx] > 0.0 {
+                        let out_val = output[out_idx * ch] / norm[out_idx];
+                        let in_idx = candidate as usize + f;
+                        if in_idx < total_frames {
+                            corr += out_val * samples[in_idx * ch];
+                        }
+                    }
+                }
+                if corr > best_corr {
+                    best_corr = corr;
+                    best = offset;
+                }
+            }
+            best
+        } else {
+            0
+        };
+
+        let actual_in = (in_frame as i32 + best_offset).max(0) as usize;
+
+        // Overlap-add with Hann window
+        for f in 0..segment_frames {
+            let w = window[f];
+            let of = out_frame + f;
+            if of >= output_frames || actual_in + f >= total_frames {
+                break;
+            }
+            for c in 0..ch {
+                output[of * ch + c] += samples[(actual_in + f) * ch + c] * w;
+            }
+            norm[of] += w;
+        }
+
+        in_frame = (actual_in + hop_in_frames).min(total_frames);
+        out_frame += hop_out_frames;
+    }
+
+    // Normalize
+    let final_frames = out_frame.min(output_frames);
+    for f in 0..final_frames {
+        if norm[f] > 0.001 {
+            for c in 0..ch {
+                output[f * ch + c] /= norm[f];
+            }
+        }
+    }
+
+    output.truncate(final_frames * ch);
+    output
+}
 
 struct VecSource {
     data: Vec<f32>,
@@ -507,7 +609,6 @@ impl Player {
 
     fn spawn_stretch(&mut self) {
         if let (Some(raw), Some(_sink)) = (&self.decoded_samples, &self.sink) {
-            let sr = self.decoded_sample_rate;
             let ch = self.decoded_channels;
             let rate = self.playback_rate;
 
@@ -517,12 +618,14 @@ impl Player {
                 return;
             }
 
-            // Only stretch a chunk from current position (60s worth of audio)
-            // to keep processing fast. Full songs can be millions of samples.
+            // Extract chunk from current position (60s) for fast processing
+            let sr = self.decoded_sample_rate;
             let samples_per_sec = sr as usize * ch as usize;
             let song_pos = self.seek_offset;
             let start_sample = (song_pos.as_secs_f64() * samples_per_sec as f64) as usize;
-            let chunk_samples = samples_per_sec * 60; // 60 seconds
+            // Align to channel boundary
+            let start_sample = (start_sample / ch as usize) * ch as usize;
+            let chunk_samples = samples_per_sec * 60;
             let end_sample = (start_sample + chunk_samples).min(raw.len());
             let chunk = raw[start_sample..end_sample].to_vec();
 
@@ -535,25 +638,11 @@ impl Player {
             self.pending_stretched = None;
 
             std::thread::spawn(move || {
-                let ratio = 1.0 / rate as f64;
-                let params = StretchParams::new(ratio)
-                    .with_sample_rate(sr)
-                    .with_channels(ch as u32)
-                    .with_quality_mode(QualityMode::LowLatency)
-                    .with_envelope_preservation(false)
-                    .with_multi_resolution(false)
-                    .with_band_split(false)
-                    .with_elastic_timing(false)
-                    .with_normalize(true);
-
-                match stretch(&chunk, &params) {
-                    Ok(s) if !s.is_empty() => {
-                        let _ = tx.send((s, rate));
-                    }
-                    _ => {
-                        // Stretch failed — signal failure
-                        let _ = tx.send((Vec::new(), rate));
-                    }
+                let result = time_stretch_wsola(&chunk, ch, rate);
+                if !result.is_empty() {
+                    let _ = tx.send((result, rate));
+                } else {
+                    let _ = tx.send((Vec::new(), rate));
                 }
             });
         }
