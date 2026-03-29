@@ -21,9 +21,9 @@ use ratatui::{
 };
 use rodio::{Decoder, OutputStream, Sink, Source};
 
-/// Simple WSOLA (Waveform Similarity Overlap-Add) time-stretcher.
-/// Changes playback speed without altering pitch. No FFT, no phase vocoder —
-/// just windowed overlap-add with best-correlation search for clean results.
+/// WSOLA time-stretcher: changes speed without pitch shift.
+/// Uses normalized cross-correlation for segment alignment and
+/// cosine cross-fade for smooth, artifact-free transitions.
 fn time_stretch_wsola(samples: &[f32], channels: u16, rate: f32) -> Vec<f32> {
     let ch = channels as usize;
     if ch == 0 || samples.is_empty() || (rate - 1.0).abs() < 0.001 {
@@ -31,96 +31,100 @@ fn time_stretch_wsola(samples: &[f32], channels: u16, rate: f32) -> Vec<f32> {
     }
 
     let total_frames = samples.len() / ch;
-    let segment_frames = 1024; // ~23ms at 44100 Hz
-    let hop_out_frames = segment_frames / 2;
-    let hop_in_frames = ((hop_out_frames as f64) * rate as f64) as usize;
-    let search_frames = 128; // search range for best overlap
+    let segment_frames: usize = 2048; // ~46ms at 44100 Hz — longer = smoother
+    let overlap_frames = segment_frames / 2; // 50% overlap for cross-fade
+    let hop_out = segment_frames - overlap_frames; // output advance
+    let hop_in = ((hop_out as f64) * rate as f64) as usize; // input advance
+    let search_range: usize = 256; // search ±256 frames for best match
 
-    if hop_in_frames == 0 || total_frames < segment_frames {
+    if hop_in == 0 || total_frames < segment_frames {
         return samples.to_vec();
     }
 
-    // Hann window
-    let window: Vec<f32> = (0..segment_frames)
-        .map(|i| {
-            0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / segment_frames as f32).cos())
-        })
-        .collect();
+    let max_output_frames = (total_frames as f64 / rate as f64) as usize + segment_frames;
+    let mut output = vec![0.0f32; max_output_frames * ch];
+    let mut out_len: usize = 0;
+    let mut in_pos: usize = 0;
 
-    let output_frames = (total_frames as f64 / rate as f64) as usize + segment_frames;
-    let mut output = vec![0.0f32; output_frames * ch];
-    let mut norm = vec![0.0f32; output_frames]; // normalization weights per frame
-
-    let mut in_frame: usize = 0;
-    let mut out_frame: usize = 0;
-
-    while in_frame + segment_frames <= total_frames && out_frame + segment_frames <= output_frames {
-        // WSOLA: find best offset within search range by cross-correlation
-        let best_offset = if out_frame >= hop_out_frames && in_frame > 0 {
-            let mut best = 0i32;
-            let mut best_corr = f32::NEG_INFINITY;
-            let range = search_frames as i32;
-
-            for offset in -range..=range {
-                let candidate = in_frame as i32 + offset;
-                if candidate < 0 || (candidate as usize + segment_frames) > total_frames {
-                    continue;
-                }
-                // Compute correlation over overlap region (first hop_out_frames)
-                let mut corr = 0.0f32;
-                let overlap_end = out_frame.min(output_frames);
-                let overlap_start = out_frame.saturating_sub(hop_out_frames);
-                let overlap_len = overlap_end - overlap_start;
-                for f in 0..overlap_len.min(hop_out_frames) {
-                    let out_idx = overlap_start + f;
-                    if out_idx < output_frames && norm[out_idx] > 0.0 {
-                        let out_val = output[out_idx * ch] / norm[out_idx];
-                        let in_idx = candidate as usize + f;
-                        if in_idx < total_frames {
-                            corr += out_val * samples[in_idx * ch];
-                        }
-                    }
-                }
-                if corr > best_corr {
-                    best_corr = corr;
-                    best = offset;
-                }
-            }
-            best
-        } else {
-            0
-        };
-
-        let actual_in = (in_frame as i32 + best_offset).max(0) as usize;
-
-        // Overlap-add with Hann window
+    // First segment: copy directly (no cross-fade needed)
+    if total_frames >= segment_frames {
         for f in 0..segment_frames {
-            let w = window[f];
-            let of = out_frame + f;
-            if of >= output_frames || actual_in + f >= total_frames {
-                break;
-            }
             for c in 0..ch {
-                output[of * ch + c] += samples[(actual_in + f) * ch + c] * w;
-            }
-            norm[of] += w;
-        }
-
-        in_frame = (actual_in + hop_in_frames).min(total_frames);
-        out_frame += hop_out_frames;
-    }
-
-    // Normalize
-    let final_frames = out_frame.min(output_frames);
-    for f in 0..final_frames {
-        if norm[f] > 0.001 {
-            for c in 0..ch {
-                output[f * ch + c] /= norm[f];
+                output[f * ch + c] = samples[f * ch + c];
             }
         }
+        out_len = segment_frames;
+        in_pos = hop_in;
     }
 
-    output.truncate(final_frames * ch);
+    while in_pos + segment_frames <= total_frames
+        && out_len + hop_out + segment_frames <= max_output_frames
+    {
+        // Find best alignment: compare start of candidate segment
+        // with the tail of current output using normalized cross-correlation
+        let mut best_offset: i32 = 0;
+        let mut best_corr = f64::NEG_INFINITY;
+        let overlap_start_out = out_len - overlap_frames;
+
+        for offset in -(search_range as i32)..=(search_range as i32) {
+            let candidate = in_pos as i32 + offset;
+            if candidate < 0 || candidate as usize + segment_frames > total_frames {
+                continue;
+            }
+            let cand = candidate as usize;
+
+            let mut dot = 0.0f64;
+            let mut energy_a = 0.0f64;
+            let mut energy_b = 0.0f64;
+
+            for f in 0..overlap_frames {
+                for c in 0..ch {
+                    let a = output[(overlap_start_out + f) * ch + c] as f64;
+                    let b = samples[(cand + f) * ch + c] as f64;
+                    dot += a * b;
+                    energy_a += a * a;
+                    energy_b += b * b;
+                }
+            }
+
+            let denom = (energy_a * energy_b).sqrt();
+            let corr = if denom > 1e-10 { dot / denom } else { 0.0 };
+
+            if corr > best_corr {
+                best_corr = corr;
+                best_offset = offset;
+            }
+        }
+
+        let actual_in = (in_pos as i32 + best_offset).max(0) as usize;
+
+        // Cosine cross-fade over the overlap region
+        let xfade_start = out_len - overlap_frames;
+        for f in 0..overlap_frames {
+            let t = f as f32 / overlap_frames as f32;
+            let fade_out = 0.5 * (1.0 + (std::f32::consts::PI * t).cos());
+            let fade_in = 1.0 - fade_out;
+            for c in 0..ch {
+                let old = output[(xfade_start + f) * ch + c];
+                let new_val = samples[(actual_in + f) * ch + c];
+                output[(xfade_start + f) * ch + c] = old * fade_out + new_val * fade_in;
+            }
+        }
+
+        // Copy the non-overlapping tail of the segment
+        let copy_start = overlap_frames;
+        let copy_end = segment_frames.min(total_frames - actual_in);
+        for f in copy_start..copy_end {
+            for c in 0..ch {
+                output[(xfade_start + f) * ch + c] = samples[(actual_in + f) * ch + c];
+            }
+        }
+
+        out_len = xfade_start + copy_end;
+        in_pos = actual_in + hop_in;
+    }
+
+    output.truncate(out_len * ch);
     output
 }
 
