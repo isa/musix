@@ -1,6 +1,7 @@
 use std::{
     fs, io,
     path::PathBuf,
+    sync::mpsc,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -19,6 +20,64 @@ use ratatui::{
     widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph},
 };
 use rodio::{Decoder, OutputStream, Sink, Source};
+use timestretch::{StretchParams, stretch, QualityMode};
+
+struct VecSource {
+    data: Vec<f32>,
+    pos: usize,
+    channels: u16,
+    sample_rate: u32,
+    duration: Option<Duration>,
+}
+
+impl VecSource {
+    fn new(data: Vec<f32>, channels: u16, sample_rate: u32) -> Self {
+        let total_samples = data.len() as u64;
+        let channels_u64 = channels as u64;
+        let sample_rate_u64 = sample_rate as u64;
+        let duration = if channels_u64 > 0 && sample_rate_u64 > 0 {
+            Some(Duration::from_secs_f64(total_samples as f64 / (channels_u64 * sample_rate_u64) as f64))
+        } else {
+            None
+        };
+        VecSource {
+            data,
+            pos: 0,
+            channels,
+            sample_rate,
+            duration,
+        }
+    }
+}
+
+impl Iterator for VecSource {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<f32> {
+        if self.pos < self.data.len() {
+            let sample = self.data[self.pos];
+            self.pos += 1;
+            Some(sample)
+        } else {
+            None
+        }
+    }
+}
+
+impl Source for VecSource {
+    fn current_frame_len(&self) -> Option<usize> {
+        Some((self.data.len() - self.pos) / self.channels as usize)
+    }
+    fn channels(&self) -> u16 {
+        self.channels
+    }
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+    fn total_duration(&self) -> Option<Duration> {
+        self.duration
+    }
+}
 
 #[derive(Clone)]
 struct Song {
@@ -48,6 +107,13 @@ struct Player {
     search_query: String,
     filtered_songs: Vec<usize>,
     g_pressed: bool,
+    playback_rate: f32,
+    decoded_samples: Option<Vec<f32>>,
+    decoded_channels: u16,
+    decoded_sample_rate: u32,
+    stretch_rx: Option<mpsc::Receiver<(Vec<f32>, f32)>>,
+    pending_stretched: Option<Vec<f32>>,
+    playing_stretched: bool,
 }
 
 impl Player {
@@ -64,8 +130,8 @@ impl Player {
 
         let _ = execute!(io::stdout(), SetTitle(&title));
     }
-    fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let songs = load_mp3_files()?;
+    fn new(music_dir: Option<PathBuf>) -> Result<Self, Box<dyn std::error::Error>> {
+        let songs = load_mp3_files(music_dir)?;
         if songs.is_empty() {
             return Err("No MP3 files found".into());
         }
@@ -98,7 +164,7 @@ impl Player {
         };
 
         let filtered_songs: Vec<usize> = (0..songs.len()).collect();
-        
+
         let player = Player {
             songs,
             current_index: 0,
@@ -118,6 +184,13 @@ impl Player {
             search_query: String::new(),
             filtered_songs,
             g_pressed: false,
+            playback_rate: 1.0,
+            decoded_samples: None,
+            decoded_channels: 0,
+            decoded_sample_rate: 0,
+            stretch_rx: None,
+            pending_stretched: None,
+            playing_stretched: false,
         };
 
         // Set initial terminal title
@@ -139,37 +212,46 @@ impl Player {
         self.selected_index = index;
         self.list_state.select(Some(self.selected_index));
         self.seek_offset = Duration::from_secs(0);
-        if let Some(ref sink) = self.sink {
+
+        let should_stretch = (self.playback_rate - 1.0).abs() >= 0.01;
+
+        let sink = self.sink.clone();
+        if let Some(sink) = sink {
             let song = &self.songs[index];
             match std::fs::File::open(&song.path) {
-                Ok(file) => {
-                    match Decoder::new(file) {
-                        Ok(source) => {
-                            // Try to get duration from the source
-                            let total_duration = source.total_duration();
+                Ok(file) => match Decoder::new(file) {
+                    Ok(source) => {
+                        let total_duration = source.total_duration();
+                        let sr = source.sample_rate();
+                        let ch = source.channels();
 
-                            let sink = sink.lock().unwrap();
-                            sink.stop();
+                        let raw_samples: Vec<f32> = source.convert_samples::<f32>().collect();
+                        self.decoded_samples = Some(raw_samples.clone());
+                        self.decoded_channels = ch;
+                        self.decoded_sample_rate = sr;
 
-                            // If we have a seek offset, we need to skip ahead
-                            if self.seek_offset > Duration::from_secs(0) {
-                                let skipped_source = source.skip_duration(self.seek_offset);
-                                sink.append(skipped_source);
-                            } else {
-                                sink.append(source);
-                            }
+                        self.stretch_rx = None;
+                        self.pending_stretched = None;
+                        self.playing_stretched = false;
 
-                            sink.play();
-                            self.is_playing = true;
-                            self.playback_start = Some(Instant::now());
-                            self.song_duration = total_duration;
-                            self.update_terminal_title();
-                        }
-                        Err(e) => {
-                            eprintln!("Warning: Could not decode audio file '{}': {e}", song.name);
-                        }
+                        let source = VecSource::new(raw_samples, ch, sr);
+
+                        let sink = sink.lock().unwrap();
+                        sink.stop();
+                        sink.set_speed(1.0);
+                        sink.append(source);
+                        sink.play();
+                        self.is_playing = true;
+                        self.playback_start = Some(Instant::now());
+                        self.song_duration = total_duration;
+                        self.seek_offset = Duration::from_secs(0);
+                        drop(sink);
+                        self.update_terminal_title();
                     }
-                }
+                    Err(e) => {
+                        eprintln!("Warning: Could not decode audio file '{}': {e}", song.name);
+                    }
+                },
                 Err(e) => {
                     eprintln!("Warning: Could not open audio file '{}': {e}", song.name);
                 }
@@ -178,33 +260,26 @@ impl Player {
             eprintln!("Warning: No audio sink available. Cannot play '{}'", self.songs[index].name);
         }
 
+        if should_stretch {
+            self.spawn_stretch();
+        }
+
         Ok(())
     }
 
     fn play_or_pause(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        // If no songs are loaded, do nothing
         if self.songs.is_empty() {
             return Ok(());
         }
 
-        // If no song has ever been played (initial state), play the selected song
-        if self.playback_start.is_none() && !self.is_playing {
+        if self.selected_index != self.current_index || self.decoded_samples.is_none() {
             self.play_song(self.selected_index)?;
-            return Ok(());
-        }
-
-        // If selected song is different from current playing song, play the selected song
-        if self.selected_index != self.current_index {
-            self.play_song(self.selected_index)?;
+        } else if self.is_playing {
+            self.pause_playback();
+            self.update_terminal_title();
         } else {
-            // If selected song is the same as current playing song, toggle play/pause
-            if self.is_playing {
-                self.pause_playback();
-                self.update_terminal_title();
-            } else {
-                self.resume_playback();
-                self.update_terminal_title();
-            }
+            self.resume_playback();
+            self.update_terminal_title();
         }
         Ok(())
     }
@@ -278,12 +353,7 @@ impl Player {
     }
 
     fn get_playback_progress(&self) -> (Duration, Option<Duration>) {
-        if let Some(start_time) = self.playback_start {
-            let elapsed = start_time.elapsed() + self.seek_offset;
-            (elapsed, self.song_duration)
-        } else {
-            (self.seek_offset, self.song_duration)
-        }
+        (self.current_song_position(), self.song_duration)
     }
 
     fn format_duration(duration: Duration) -> String {
@@ -295,10 +365,8 @@ impl Player {
 
     fn pause_playback(&mut self) {
         if self.is_playing {
-            // Store current progress before pausing
-            if let Some(start_time) = self.playback_start {
-                self.seek_offset += start_time.elapsed();
-            }
+            // Store current song position before pausing
+            self.seek_offset = self.current_song_position();
 
             if let Some(ref sink) = self.sink {
                 let sink = sink.lock().unwrap();
@@ -312,6 +380,10 @@ impl Player {
 
     fn resume_playback(&mut self) {
         if !self.is_playing && !self.songs.is_empty() {
+            if let Some(stretched) = self.pending_stretched.take() {
+                self.apply_stretched(stretched);
+                return;
+            }
             if let Some(ref sink) = self.sink {
                 let sink = sink.lock().unwrap();
                 sink.play();
@@ -323,45 +395,266 @@ impl Player {
     }
 
     fn seek(&mut self, offset_seconds: i32) {
-        if !self.songs.is_empty() && self.is_playing {
-            if let Some(ref sink) = self.sink {
-                // Get current actual position (including elapsed time since playback start)
-                let current_position = if let Some(start_time) = self.playback_start {
-                    self.seek_offset + start_time.elapsed()
-                } else {
-                    self.seek_offset
-                };
+        if self.songs.is_empty() {
+            return;
+        }
 
-                let seek_duration = Duration::from_secs(offset_seconds.unsigned_abs().into());
-                let new_position = if offset_seconds < 0 {
-                    // Seek backward
-                    if current_position > seek_duration {
-                        current_position - seek_duration
-                    } else {
-                        Duration::from_secs(0)
-                    }
-                } else {
-                    // Seek forward
-                    current_position + seek_duration
-                };
+        let current_position = self.current_song_position();
+        let seek_duration = Duration::from_secs(offset_seconds.unsigned_abs().into());
+        let new_position = if offset_seconds < 0 {
+            if current_position > seek_duration {
+                current_position - seek_duration
+            } else {
+                Duration::from_secs(0)
+            }
+        } else {
+            current_position + seek_duration
+        };
 
-                // Try to seek using rodio's try_seek method
-                let sink = sink.lock().unwrap();
-                match sink.try_seek(new_position) {
-                    Ok(()) => {
-                        // Seeking succeeded, update our tracking variables
-                        self.seek_offset = new_position;
-                        self.playback_start = Some(Instant::now());
-                    }
-                    Err(_) => {
-                        // Seeking failed, fall back to restarting from new position
-                        drop(sink);
-                        self.seek_offset = new_position;
-                        let _ = self.play_song(self.current_index);
-                    }
+        // Determine which samples to use: stretched or original
+        let samples = if let Some(ref raw) = self.decoded_samples {
+            raw.clone()
+        } else {
+            return;
+        };
+
+        let sr = self.decoded_sample_rate;
+        let ch = self.decoded_channels;
+
+        if let Some(ref sink_arc) = self.sink {
+            let source = VecSource::new(samples, ch, sr);
+            let skipped = source.skip_duration(new_position);
+
+            let sink = sink_arc.lock().unwrap();
+            sink.stop();
+            sink.set_speed(1.0);
+            sink.append(skipped);
+            sink.play();
+            drop(sink);
+
+            self.seek_offset = new_position;
+            self.playback_start = Some(Instant::now());
+            self.playing_stretched = false;
+            self.is_playing = true;
+
+            // If we had a non-1.0 rate, re-trigger stretch from new position
+            if (self.playback_rate - 1.0).abs() >= 0.01 {
+                self.spawn_stretch();
+                // Pause and wait for stretch like change_playback_rate does
+                if let Some(ref sink) = self.sink {
+                    let sink = sink.lock().unwrap();
+                    sink.pause();
+                }
+                self.is_playing = false;
+            }
+        }
+    }
+
+    fn change_playback_rate(&mut self, delta: f32) {
+        let new_rate = (self.playback_rate + delta).clamp(0.25, 4.0);
+        let new_rate = (new_rate * 100.0).round() / 100.0;
+
+        // Save current song position before changing rate
+        let song_pos = self.current_song_position();
+        self.seek_offset = song_pos;
+        self.playback_start = None;
+
+        self.playback_rate = new_rate;
+        self.playing_stretched = false;
+
+        // Pause audio while stretch computes — avoids chipmunk/horror pitch artifacts
+        if let Some(ref sink) = self.sink {
+            let sink = sink.lock().unwrap();
+            sink.pause();
+        }
+        self.is_playing = false;
+
+        self.spawn_stretch();
+    }
+
+    fn reset_playback_rate(&mut self) {
+        let song_pos = self.current_song_position();
+        let was_stretched = self.playing_stretched;
+        let was_stretching = self.stretch_rx.is_some();
+
+        self.playback_rate = 1.0;
+        self.stretch_rx = None;
+        self.pending_stretched = None;
+        self.playing_stretched = false;
+
+        if was_stretched || was_stretching {
+            // Reload original samples at current position and resume
+            if let Some(raw) = self.decoded_samples.clone() {
+                let sr = self.decoded_sample_rate;
+                let ch = self.decoded_channels;
+                if let Some(ref sink_arc) = self.sink {
+                    let source = VecSource::new(raw, ch, sr);
+                    let skipped = source.skip_duration(song_pos);
+                    let sink = sink_arc.lock().unwrap();
+                    sink.stop();
+                    sink.set_speed(1.0);
+                    sink.append(skipped);
+                    sink.play();
+                    drop(sink);
+                    self.seek_offset = song_pos;
+                    self.playback_start = Some(Instant::now());
+                    self.is_playing = true;
                 }
             }
         }
+        // If not stretched and not stretching, audio is already playing original at speed 1.0
+    }
+
+    fn spawn_stretch(&mut self) {
+        if let (Some(raw), Some(_sink)) = (&self.decoded_samples, &self.sink) {
+            let sr = self.decoded_sample_rate;
+            let ch = self.decoded_channels;
+            let rate = self.playback_rate;
+
+            if (rate - 1.0).abs() < 0.01 {
+                self.stretch_rx = None;
+                self.pending_stretched = None;
+                return;
+            }
+
+            // Only stretch a chunk from current position (60s worth of audio)
+            // to keep processing fast. Full songs can be millions of samples.
+            let samples_per_sec = sr as usize * ch as usize;
+            let song_pos = self.seek_offset;
+            let start_sample = (song_pos.as_secs_f64() * samples_per_sec as f64) as usize;
+            let chunk_samples = samples_per_sec * 60; // 60 seconds
+            let end_sample = (start_sample + chunk_samples).min(raw.len());
+            let chunk = raw[start_sample..end_sample].to_vec();
+
+            if chunk.is_empty() {
+                return;
+            }
+
+            let (tx, rx) = mpsc::channel();
+            self.stretch_rx = Some(rx);
+            self.pending_stretched = None;
+
+            std::thread::spawn(move || {
+                let ratio = 1.0 / rate as f64;
+                let params = StretchParams::new(ratio)
+                    .with_sample_rate(sr)
+                    .with_channels(ch as u32)
+                    .with_quality_mode(QualityMode::LowLatency)
+                    .with_envelope_preservation(false)
+                    .with_multi_resolution(false)
+                    .with_band_split(false)
+                    .with_elastic_timing(false)
+                    .with_normalize(true);
+
+                match stretch(&chunk, &params) {
+                    Ok(s) if !s.is_empty() => {
+                        let _ = tx.send((s, rate));
+                    }
+                    _ => {
+                        // Stretch failed — signal failure
+                        let _ = tx.send((Vec::new(), rate));
+                    }
+                }
+            });
+        }
+    }
+
+    fn check_stretch_result(&mut self) {
+        if let Some(ref rx) = self.stretch_rx {
+            match rx.try_recv() {
+                Ok((stretched, rate)) => {
+                    self.stretch_rx = None;
+                    if (self.playback_rate - rate).abs() >= 0.01 {
+                        return;
+                    }
+                    if stretched.is_empty() {
+                        // Stretch failed — resume original audio at current position
+                        self.resume_original_audio();
+                    } else {
+                        self.apply_stretched(stretched);
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.stretch_rx = None;
+                    // Thread died — resume original audio
+                    self.resume_original_audio();
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+    }
+
+    /// Resume playing original (un-stretched) audio from current position.
+    /// Used as fallback when stretch fails.
+    fn resume_original_audio(&mut self) {
+        if let Some(raw) = self.decoded_samples.clone() {
+            let sr = self.decoded_sample_rate;
+            let ch = self.decoded_channels;
+            let song_pos = self.seek_offset; // playback_start is None when paused
+            if let Some(ref sink_arc) = self.sink {
+                let source = VecSource::new(raw, ch, sr);
+                let skipped = source.skip_duration(song_pos);
+                let sink = sink_arc.lock().unwrap();
+                sink.stop();
+                sink.set_speed(1.0);
+                sink.append(skipped);
+                sink.play();
+                drop(sink);
+                self.playback_start = Some(Instant::now());
+                self.is_playing = true;
+                self.playing_stretched = false;
+            }
+        }
+    }
+
+    /// Returns the current position in the original song (accounting for playback rate).
+    fn current_song_position(&self) -> Duration {
+        let elapsed = if let Some(start_time) = self.playback_start {
+            start_time.elapsed()
+        } else {
+            Duration::from_secs(0)
+        };
+
+        if self.playing_stretched {
+            // Stretched audio plays at sink speed 1.0, but the audio itself is
+            // time-compressed. 1 second of wall-clock = playback_rate seconds of song.
+            self.seek_offset + elapsed.mul_f32(self.playback_rate)
+        } else {
+            // Original audio plays at sink speed 1.0 (no set_speed).
+            // 1 second of wall-clock = 1 second of song.
+            self.seek_offset + elapsed
+        }
+    }
+
+    fn apply_stretched(&mut self, stretched: Vec<f32>) {
+        if stretched.is_empty() {
+            return;
+        }
+        let sink_arc = match self.sink {
+            Some(ref s) => s.clone(),
+            None => return,
+        };
+
+        let sr = self.decoded_sample_rate;
+        let ch = self.decoded_channels;
+
+        // The stretched chunk starts at seek_offset (set before spawning stretch).
+        // No need to skip — it's already trimmed to the right starting position.
+        let source = VecSource::new(stretched, ch, sr);
+
+        {
+            let sink = sink_arc.lock().unwrap();
+            sink.stop();
+            sink.set_speed(1.0);
+            sink.append(source);
+            sink.play();
+        }
+
+        self.playing_stretched = true;
+        // seek_offset stays at the song position where the chunk starts
+        self.playback_start = Some(Instant::now());
+        self.is_playing = true;
+        self.update_terminal_title();
     }
 
     fn fuzzy_search(&mut self, query: &str) {
@@ -369,24 +662,21 @@ impl Player {
             self.filtered_songs = (0..self.songs.len()).collect();
         } else {
             let query_lower = query.to_lowercase();
-            let mut matches: Vec<(usize, f32)> = self.songs
+            let mut matches: Vec<(usize, f32)> = self
+                .songs
                 .iter()
                 .enumerate()
                 .filter_map(|(index, song)| {
                     let song_name_lower = song.name.to_lowercase();
                     let score = Self::fuzzy_match_score(&query_lower, &song_name_lower);
-                    if score > 0.0 {
-                        Some((index, score))
-                    } else {
-                        None
-                    }
+                    if score > 0.0 { Some((index, score)) } else { None }
                 })
                 .collect();
-            
+
             matches.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             self.filtered_songs = matches.into_iter().map(|(index, _)| index).collect();
         }
-        
+
         if !self.filtered_songs.is_empty() {
             self.selected_index = self.filtered_songs[0];
             self.list_state.select(Some(0));
@@ -397,25 +687,25 @@ impl Player {
         if query.is_empty() {
             return 1.0;
         }
-        
+
         if text.contains(query) {
             let exact_match_bonus = if text == query { 2.0 } else { 1.5 };
             let starts_with_bonus = if text.starts_with(query) { 1.2 } else { 1.0 };
             return exact_match_bonus * starts_with_bonus;
         }
-        
+
         let mut score = 0.0;
         let query_chars: Vec<char> = query.chars().collect();
         let text_chars: Vec<char> = text.chars().collect();
         let mut query_index = 0;
-        
+
         for (text_index, text_char) in text_chars.iter().enumerate() {
             if query_index < query_chars.len() && *text_char == query_chars[query_index] {
                 score += 1.0 / (text_index as f32 + 1.0);
                 query_index += 1;
             }
         }
-        
+
         if query_index == query_chars.len() {
             score / query_chars.len() as f32
         } else {
@@ -449,10 +739,7 @@ impl Player {
             return;
         }
 
-        let current_filtered_index = self.filtered_songs
-            .iter()
-            .position(|&index| index == self.selected_index)
-            .unwrap_or(0);
+        let current_filtered_index = self.filtered_songs.iter().position(|&index| index == self.selected_index).unwrap_or(0);
 
         let new_filtered_index = if direction > 0 {
             (current_filtered_index + 1) % self.filtered_songs.len()
@@ -474,7 +761,7 @@ impl Player {
         if self.songs.is_empty() {
             return;
         }
-        
+
         if self.search_mode {
             if !self.filtered_songs.is_empty() {
                 self.selected_index = self.filtered_songs[0];
@@ -490,7 +777,7 @@ impl Player {
         if self.songs.is_empty() {
             return;
         }
-        
+
         if self.search_mode {
             if !self.filtered_songs.is_empty() {
                 let last_index = self.filtered_songs.len() - 1;
@@ -504,30 +791,19 @@ impl Player {
     }
 }
 
-fn load_mp3_files() -> Result<Vec<Song>, Box<dyn std::error::Error>> {
+fn load_mp3_files(music_dir: Option<PathBuf>) -> Result<Vec<Song>, Box<dyn std::error::Error>> {
     let mut songs = Vec::new();
 
-    // Try multiple directories in order of preference
-    let potential_dirs = vec![
-        {
-            // User's Music directory
-            let home_dir = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-            PathBuf::from(format!("{home_dir}/Music"))
-        },
-        PathBuf::from("./data"),
-    ];
-
-    for data_dir in potential_dirs {
-        if data_dir.exists() {
-            match visit_dir(&data_dir, &mut songs) {
-                Ok(_) => {
-                    //eprintln!("Loaded {} MP3 files from: {data_dir:?}", songs.len());  // break;
-                }
-                Err(e) => {
-                    eprintln!("Warning: Could not access directory {data_dir:?}: {e}");
-                    continue;
-                }
-            }
+    if let Some(dir) = music_dir {
+        if dir.exists() {
+            visit_dir(&dir, &mut songs)?;
+        } else {
+            return Err(format!("Directory not found: {}", dir.display()).into());
+        }
+    } else {
+        let dir = PathBuf::from(".");
+        if dir.exists() {
+            visit_dir(&dir, &mut songs)?;
         }
     }
 
@@ -579,7 +855,11 @@ fn ui(f: &mut Frame, player: &Player) {
         .iter()
         .enumerate()
         .map(|(_display_index, &(actual_index, song))| {
-            let playing_indicator = if actual_index == player.current_index && player.is_playing { "♪ " } else { "  " };
+            let playing_indicator = if actual_index == player.current_index && player.is_playing {
+                "♪ "
+            } else {
+                "  "
+            };
 
             let content = format!("{playing_indicator}{}. {}", actual_index + 1, song.name);
 
@@ -625,7 +905,6 @@ fn ui(f: &mut Frame, player: &Player) {
         0.0
     };
 
-    
     let progress_label_text = if let Some(duration) = total {
         format!(" {}/{} ", Player::format_duration(elapsed), Player::format_duration(duration))
     } else {
@@ -649,15 +928,23 @@ fn ui(f: &mut Frame, player: &Player) {
 
     // Status
     let mode_text = if player.random_mode { "RANDOM" } else { "NORMAL" };
-    let song_count = if player.search_mode { 
+    let song_count = if player.search_mode {
         format!("{}/{}", player.filtered_songs.len(), player.songs.len())
     } else {
         player.songs.len().to_string()
     };
 
+    let rate_text = if player.playback_rate == 1.0 && player.stretch_rx.is_none() {
+        String::new()
+    } else if player.stretch_rx.is_some() {
+        format!(" | Speed: {:.2}x (processing...)", player.playback_rate)
+    } else {
+        format!(" | Speed: {:.2}x", player.playback_rate)
+    };
+
     let status_content = if player.search_mode {
         vec![Line::from(vec![
-            Span::raw(format!("  Search Mode | Songs: {} | ", song_count)),
+            Span::raw(format!("  Search Mode | Songs: {}{} | ", song_count, rate_text)),
             Span::styled("Esc", Style::default().fg(PRIMARY_COLOR).add_modifier(Modifier::BOLD)),
             Span::raw(": Exit Search | "),
             Span::styled("Enter", Style::default().fg(PRIMARY_COLOR).add_modifier(Modifier::BOLD)),
@@ -665,22 +952,20 @@ fn ui(f: &mut Frame, player: &Player) {
         ])]
     } else {
         vec![Line::from(vec![
-            Span::raw(format!("  Mode: {} | Songs: {} | ", mode_text, song_count)),
+            Span::raw(format!("  Mode: {} | Songs: {}{} | ", mode_text, song_count, rate_text)),
             Span::styled("/", Style::default().fg(PRIMARY_COLOR).add_modifier(Modifier::BOLD)),
             Span::raw(": Search | "),
-            Span::styled("x", Style::default().fg(PRIMARY_COLOR).add_modifier(Modifier::BOLD)),
+            Span::styled("?", Style::default().fg(PRIMARY_COLOR).add_modifier(Modifier::BOLD)),
             Span::raw(": Help  "),
         ])]
     };
 
-    let status = Paragraph::new(status_content)
-        .alignment(Alignment::Left)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Status")
-                .border_style(Style::default().fg(PRIMARY_COLOR)),
-        );
+    let status = Paragraph::new(status_content).alignment(Alignment::Left).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Status")
+            .border_style(Style::default().fg(PRIMARY_COLOR)),
+    );
     f.render_widget(status, chunks[3]);
 
     // Controls popup
@@ -725,12 +1010,24 @@ fn ui(f: &mut Frame, player: &Player) {
                 Span::raw(" - Toggle random mode"),
             ]),
             Line::from(vec![
+                Span::styled(" +/=       ", Style::default().fg(PRIMARY_COLOR).add_modifier(Modifier::BOLD)),
+                Span::raw(" - Increase speed (+0.1x)"),
+            ]),
+            Line::from(vec![
+                Span::styled(" -         ", Style::default().fg(PRIMARY_COLOR).add_modifier(Modifier::BOLD)),
+                Span::raw(" - Decrease speed (-0.1x)"),
+            ]),
+            Line::from(vec![
+                Span::styled(" 0         ", Style::default().fg(PRIMARY_COLOR).add_modifier(Modifier::BOLD)),
+                Span::raw(" - Reset speed (1.0x)"),
+            ]),
+            Line::from(vec![
                 Span::styled(" q/Esc     ", Style::default().fg(PRIMARY_COLOR).add_modifier(Modifier::BOLD)),
                 Span::raw(" - Exit application"),
             ]),
             Line::from(vec![
-                Span::styled(" x         ", Style::default().fg(PRIMARY_COLOR).add_modifier(Modifier::BOLD)),
-                Span::raw(" - Close this popup"),
+                Span::styled(" ?         ", Style::default().fg(PRIMARY_COLOR).add_modifier(Modifier::BOLD)),
+                Span::raw(" - Toggle this help"),
             ]),
         ])
         .alignment(Alignment::Left)
@@ -764,8 +1061,9 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: ratatui::prelude::Rect) -> r
         .split(popup_layout[1])[1]
 }
 
-fn run_player() -> Result<(), Box<dyn std::error::Error>> {
-    let mut player = match Player::new() {
+fn run_player(music_dir: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    let auto_play = music_dir.is_some();
+    let mut player = match Player::new(music_dir) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Player initialization failed: {e}");
@@ -775,14 +1073,16 @@ fn run_player() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     if player.songs.is_empty() {
-        println!("No MP3 files found in any accessible directory.");
-        println!("MUSIX searched for MP3 files in:");
-        println!("  - ~/Music (user's music directory)");
-        println!("  - ./data (current directory)");
+        println!("No MP3 files found in the current directory.");
         println!();
-        println!("To test MUSIX, you can:");
-        println!("Copy MP3 files to ./data directory");
+        println!("Usage: musix [folder]");
+        println!("  musix              - play MP3s from current directory");
+        println!("  musix <folder>     - play MP3s from specified folder");
         return Ok(());
+    }
+
+    if auto_play {
+        let _ = player.play_song(0);
     }
 
     match enable_raw_mode() {
@@ -839,7 +1139,7 @@ fn main_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, player: &mut
                 if key.code != KeyCode::Char('g') || key.modifiers != KeyModifiers::NONE {
                     player.g_pressed = false;
                 }
-                
+
                 match key {
                     KeyEvent {
                         code: KeyCode::Esc,
@@ -854,7 +1154,7 @@ fn main_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, player: &mut
                             break;
                         }
                     }
-                    
+
                     KeyEvent {
                         code: KeyCode::Char('c'),
                         modifiers: KeyModifiers::CONTROL,
@@ -865,7 +1165,8 @@ fn main_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, player: &mut
                         code: KeyCode::Up,
                         modifiers: KeyModifiers::NONE,
                         ..
-                    } | KeyEvent {
+                    }
+                    | KeyEvent {
                         code: KeyCode::Char('k'),
                         modifiers: KeyModifiers::NONE,
                         ..
@@ -881,7 +1182,8 @@ fn main_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, player: &mut
                         code: KeyCode::Down,
                         modifiers: KeyModifiers::NONE,
                         ..
-                    } | KeyEvent {
+                    }
+                    | KeyEvent {
                         code: KeyCode::Char('j'),
                         modifiers: KeyModifiers::NONE,
                         ..
@@ -1053,15 +1355,56 @@ fn main_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, player: &mut
                     }
 
                     KeyEvent {
-                        code: KeyCode::Char('x'),
+                        code: KeyCode::Char('+' | '='),
                         modifiers: KeyModifiers::NONE,
                         ..
                     } => {
                         if player.search_mode {
-                            player.search_query.push('x');
+                            player.search_query.push(match key.code {
+                                KeyCode::Char('+') => '+',
+                                _ => '=',
+                            });
                             let query = player.search_query.clone();
                             player.fuzzy_search(&query);
                         } else {
+                            player.change_playback_rate(0.1);
+                        }
+                    }
+
+                    KeyEvent {
+                        code: KeyCode::Char('-'),
+                        modifiers: KeyModifiers::NONE,
+                        ..
+                    } => {
+                        if player.search_mode {
+                            player.search_query.push('-');
+                            let query = player.search_query.clone();
+                            player.fuzzy_search(&query);
+                        } else {
+                            player.change_playback_rate(-0.1);
+                        }
+                    }
+
+                    KeyEvent {
+                        code: KeyCode::Char('0'),
+                        modifiers: KeyModifiers::NONE,
+                        ..
+                    } => {
+                        if player.search_mode {
+                            player.search_query.push('0');
+                            let query = player.search_query.clone();
+                            player.fuzzy_search(&query);
+                        } else {
+                            player.reset_playback_rate();
+                        }
+                    }
+
+                    KeyEvent {
+                        code: KeyCode::Char('?'),
+                        modifiers: KeyModifiers::NONE,
+                        ..
+                    } => {
+                        if !player.search_mode {
                             player.show_controls_popup = !player.show_controls_popup;
                         }
                     }
@@ -1139,16 +1482,37 @@ fn main_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, player: &mut
             }
         }
 
-        // Check if current song finished and auto-play next
-        if player.is_playing {
+        // Check if stretch completed in background
+        player.check_stretch_result();
+
+        // Check if current song/chunk finished
+        if player.is_playing && player.stretch_rx.is_none() {
             if let Some(ref sink) = player.sink {
                 let sink = sink.lock().unwrap();
                 if sink.empty() {
                     drop(sink);
-                    player.is_playing = false;
-                    player.playback_start = None;
-                    player.seek_offset = Duration::from_secs(0);
-                    player.next_song()?;
+
+                    let song_pos = player.current_song_position();
+                    let song_done = match player.song_duration {
+                        Some(dur) => song_pos >= dur,
+                        None => true,
+                    };
+
+                    if player.playing_stretched && !song_done {
+                        // Stretched chunk ended but song continues — stretch next chunk
+                        player.seek_offset = song_pos;
+                        player.playback_start = None;
+                        player.playing_stretched = false;
+                        player.is_playing = false;
+                        player.spawn_stretch();
+                    } else {
+                        // Song actually finished — play next
+                        player.is_playing = false;
+                        player.playback_start = None;
+                        player.seek_offset = Duration::from_secs(0);
+                        player.playing_stretched = false;
+                        player.next_song()?;
+                    }
                 }
             }
         }
@@ -1158,7 +1522,20 @@ fn main_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, player: &mut
 }
 
 fn main() {
-    if let Err(e) = run_player() {
+    let music_dir = std::env::args().nth(1).map(PathBuf::from);
+
+    if let Some(ref dir) = music_dir {
+        if !dir.exists() {
+            eprintln!("Error: Directory not found: {}", dir.display());
+            std::process::exit(1);
+        }
+        if !dir.is_dir() {
+            eprintln!("Error: Not a directory: {}", dir.display());
+            std::process::exit(1);
+        }
+    }
+
+    if let Err(e) = run_player(music_dir) {
         eprintln!("Error: {e}");
         std::process::exit(1);
     }
