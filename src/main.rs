@@ -220,6 +220,10 @@ struct Player {
     stretch_rx: Option<mpsc::Receiver<(Vec<f32>, f32)>>,
     pending_stretched: Option<Vec<f32>>,
     playing_stretched: bool,
+    next_chunk: Option<Vec<f32>>,
+    next_chunk_rx: Option<mpsc::Receiver<(Vec<f32>, f32)>>,
+    /// The song position where the current stretched chunk ends (in original time)
+    chunk_end_pos: Duration,
 }
 
 impl Player {
@@ -297,6 +301,9 @@ impl Player {
             stretch_rx: None,
             pending_stretched: None,
             playing_stretched: false,
+            next_chunk: None,
+            next_chunk_rx: None,
+            chunk_end_pos: Duration::from_secs(0),
         };
 
         // Set initial terminal title
@@ -332,6 +339,15 @@ impl Player {
                         let ch = source.channels();
 
                         let raw_samples: Vec<f32> = source.convert_samples::<f32>().collect();
+                        // Compute duration from decoded samples (more reliable than decoder metadata for MP3)
+                        let computed_duration = if sr > 0 && ch > 0 {
+                            Some(Duration::from_secs_f64(
+                                raw_samples.len() as f64 / (sr as f64 * ch as f64),
+                            ))
+                        } else {
+                            None
+                        };
+
                         self.decoded_samples = Some(raw_samples.clone());
                         self.decoded_channels = ch;
                         self.decoded_sample_rate = sr;
@@ -339,6 +355,8 @@ impl Player {
                         self.stretch_rx = None;
                         self.pending_stretched = None;
                         self.playing_stretched = false;
+                        self.next_chunk = None;
+                        self.next_chunk_rx = None;
 
                         let source = VecSource::new(raw_samples, ch, sr);
 
@@ -349,7 +367,7 @@ impl Player {
                         sink.play();
                         self.is_playing = true;
                         self.playback_start = Some(Instant::now());
-                        self.song_duration = total_duration;
+                        self.song_duration = total_duration.or(computed_duration);
                         self.seek_offset = Duration::from_secs(0);
                         drop(sink);
                         self.update_terminal_title();
@@ -508,52 +526,12 @@ impl Player {
         let current_position = self.current_song_position();
         let seek_duration = Duration::from_secs(offset_seconds.unsigned_abs().into());
         let new_position = if offset_seconds < 0 {
-            if current_position > seek_duration {
-                current_position - seek_duration
-            } else {
-                Duration::from_secs(0)
-            }
+            current_position.saturating_sub(seek_duration)
         } else {
             current_position + seek_duration
         };
 
-        // Determine which samples to use: stretched or original
-        let samples = if let Some(ref raw) = self.decoded_samples {
-            raw.clone()
-        } else {
-            return;
-        };
-
-        let sr = self.decoded_sample_rate;
-        let ch = self.decoded_channels;
-
-        if let Some(ref sink_arc) = self.sink {
-            let source = VecSource::new(samples, ch, sr);
-            let skipped = source.skip_duration(new_position);
-
-            let sink = sink_arc.lock().unwrap();
-            sink.stop();
-            sink.set_speed(1.0);
-            sink.append(skipped);
-            sink.play();
-            drop(sink);
-
-            self.seek_offset = new_position;
-            self.playback_start = Some(Instant::now());
-            self.playing_stretched = false;
-            self.is_playing = true;
-
-            // If we had a non-1.0 rate, re-trigger stretch from new position
-            if (self.playback_rate - 1.0).abs() >= 0.01 {
-                self.spawn_stretch();
-                // Pause and wait for stretch like change_playback_rate does
-                if let Some(ref sink) = self.sink {
-                    let sink = sink.lock().unwrap();
-                    sink.pause();
-                }
-                self.is_playing = false;
-            }
-        }
+        self.seek_to_position(new_position);
     }
 
     fn change_playback_rate(&mut self, delta: f32) {
@@ -611,45 +589,62 @@ impl Player {
         // If not stretched and not stretching, audio is already playing original at speed 1.0
     }
 
+    /// Stretch a 60s chunk starting from `self.seek_offset`, store receiver in `stretch_rx`.
     fn spawn_stretch(&mut self) {
-        if let (Some(raw), Some(_sink)) = (&self.decoded_samples, &self.sink) {
-            let ch = self.decoded_channels;
-            let rate = self.playback_rate;
+        self.stretch_rx = self.spawn_stretch_at(self.seek_offset);
+        self.pending_stretched = None;
+        self.next_chunk = None;
+        self.next_chunk_rx = None;
+    }
 
-            if (rate - 1.0).abs() < 0.01 {
-                self.stretch_rx = None;
-                self.pending_stretched = None;
-                return;
-            }
+    /// Spawn a stretch thread for the chunk starting at `start_pos`.
+    /// Returns the receiver, or None if nothing to stretch.
+    fn spawn_stretch_at(&self, start_pos: Duration) -> Option<mpsc::Receiver<(Vec<f32>, f32)>> {
+        let raw = self.decoded_samples.as_ref()?;
+        let _ = self.sink.as_ref()?;
+        let ch = self.decoded_channels;
+        let rate = self.playback_rate;
 
-            // Extract chunk from current position (60s) for fast processing
-            let sr = self.decoded_sample_rate;
-            let samples_per_sec = sr as usize * ch as usize;
-            let song_pos = self.seek_offset;
-            let start_sample = (song_pos.as_secs_f64() * samples_per_sec as f64) as usize;
-            // Align to channel boundary
-            let start_sample = (start_sample / ch as usize) * ch as usize;
-            let chunk_samples = samples_per_sec * 60;
-            let end_sample = (start_sample + chunk_samples).min(raw.len());
-            let chunk = raw[start_sample..end_sample].to_vec();
-
-            if chunk.is_empty() {
-                return;
-            }
-
-            let (tx, rx) = mpsc::channel();
-            self.stretch_rx = Some(rx);
-            self.pending_stretched = None;
-
-            std::thread::spawn(move || {
-                let result = time_stretch_wsola(&chunk, ch, rate);
-                if !result.is_empty() {
-                    let _ = tx.send((result, rate));
-                } else {
-                    let _ = tx.send((Vec::new(), rate));
-                }
-            });
+        if (rate - 1.0).abs() < 0.01 {
+            return None;
         }
+
+        let sr = self.decoded_sample_rate;
+        let samples_per_sec = sr as usize * ch as usize;
+        let start_sample = (start_pos.as_secs_f64() * samples_per_sec as f64) as usize;
+        let start_sample = (start_sample / ch as usize) * ch as usize;
+        let chunk_samples = samples_per_sec * 60;
+        let end_sample = (start_sample + chunk_samples).min(raw.len());
+
+        if start_sample >= raw.len() {
+            return None;
+        }
+
+        let chunk = raw[start_sample..end_sample].to_vec();
+        if chunk.is_empty() {
+            return None;
+        }
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = time_stretch_wsola(&chunk, ch, rate);
+            if !result.is_empty() {
+                let _ = tx.send((result, rate));
+            } else {
+                let _ = tx.send((Vec::new(), rate));
+            }
+        });
+
+        Some(rx)
+    }
+
+    /// Pre-fetch the next chunk so it's ready when the current one ends.
+    fn prefetch_next_chunk(&mut self) {
+        if self.next_chunk.is_some() || self.next_chunk_rx.is_some() {
+            return; // already prefetching or ready
+        }
+        let next_pos = self.chunk_end_pos;
+        self.next_chunk_rx = self.spawn_stretch_at(next_pos);
     }
 
     fn check_stretch_result(&mut self) {
@@ -677,6 +672,30 @@ impl Player {
         }
     }
 
+    /// Check if the pre-fetched next chunk is ready.
+    fn check_next_chunk(&mut self) {
+        if self.next_chunk.is_some() {
+            return; // already have it
+        }
+        if let Some(ref rx) = self.next_chunk_rx {
+            match rx.try_recv() {
+                Ok((stretched, rate)) => {
+                    self.next_chunk_rx = None;
+                    if (self.playback_rate - rate).abs() >= 0.01 {
+                        return;
+                    }
+                    if !stretched.is_empty() {
+                        self.next_chunk = Some(stretched);
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.next_chunk_rx = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+    }
+
     /// Resume playing original (un-stretched) audio from current position.
     /// Used as fallback when stretch fails.
     fn resume_original_audio(&mut self) {
@@ -698,6 +717,74 @@ impl Player {
                 self.playing_stretched = false;
             }
         }
+    }
+
+    /// Seek to a percentage of the song (1-9 = 10%-90%).
+    fn seek_to_percentage(&mut self, pct: u32) {
+        if self.songs.is_empty() || self.decoded_samples.is_none() {
+            return;
+        }
+        let total = self.get_song_duration_computed();
+        if total.as_secs() == 0 {
+            return;
+        }
+        let target = total.mul_f32(pct as f32 / 10.0);
+        self.seek_to_position(target);
+    }
+
+    /// Seek to an absolute position in the song.
+    fn seek_to_position(&mut self, position: Duration) {
+        let max_pos = self.get_song_duration_computed();
+        let new_position = position.min(max_pos);
+
+        let samples = if let Some(ref raw) = self.decoded_samples {
+            raw.clone()
+        } else {
+            return;
+        };
+
+        let sr = self.decoded_sample_rate;
+        let ch = self.decoded_channels;
+
+        if let Some(ref sink_arc) = self.sink {
+            let source = VecSource::new(samples, ch, sr);
+            let skipped = source.skip_duration(new_position);
+
+            let sink = sink_arc.lock().unwrap();
+            sink.stop();
+            sink.set_speed(1.0);
+            sink.append(skipped);
+            sink.play();
+            drop(sink);
+
+            self.seek_offset = new_position;
+            self.playback_start = Some(Instant::now());
+            self.playing_stretched = false;
+            self.is_playing = true;
+            self.next_chunk = None;
+            self.next_chunk_rx = None;
+
+            if (self.playback_rate - 1.0).abs() >= 0.01 {
+                self.spawn_stretch();
+                if let Some(ref sink) = self.sink {
+                    let sink = sink.lock().unwrap();
+                    sink.pause();
+                }
+                self.is_playing = false;
+            }
+        }
+    }
+
+    /// Reliable song duration from decoded samples (or metadata fallback).
+    fn get_song_duration_computed(&self) -> Duration {
+        if let Some(ref raw) = self.decoded_samples {
+            let sr = self.decoded_sample_rate;
+            let ch = self.decoded_channels;
+            if sr > 0 && ch > 0 {
+                return Duration::from_secs_f64(raw.len() as f64 / (sr as f64 * ch as f64));
+            }
+        }
+        self.song_duration.unwrap_or(Duration::from_secs(0))
     }
 
     /// Returns the current position in the original song (accounting for playback rate).
@@ -731,8 +818,6 @@ impl Player {
         let sr = self.decoded_sample_rate;
         let ch = self.decoded_channels;
 
-        // The stretched chunk starts at seek_offset (set before spawning stretch).
-        // No need to skip — it's already trimmed to the right starting position.
         let source = VecSource::new(stretched, ch, sr);
 
         {
@@ -744,10 +829,14 @@ impl Player {
         }
 
         self.playing_stretched = true;
-        // seek_offset stays at the song position where the chunk starts
         self.playback_start = Some(Instant::now());
         self.is_playing = true;
+        // Track where this chunk ends in original song time (seek_offset + 60s of original audio)
+        self.chunk_end_pos = self.seek_offset + Duration::from_secs(60);
         self.update_terminal_title();
+
+        // Start pre-fetching the next chunk immediately
+        self.prefetch_next_chunk();
     }
 
     fn fuzzy_search(&mut self, query: &str) {
@@ -986,11 +1075,11 @@ fn ui(f: &mut Frame, player: &Player) {
 
     f.render_stateful_widget(songs_list, chunks[1], &mut player.list_state.clone());
 
-    // Progress bar
+    // Progress bar with separate time display
     let (elapsed, total) = player.get_playback_progress();
     let progress_ratio = if let Some(duration) = total {
-        if duration.as_secs() > 0 {
-            (elapsed.as_secs() as f64 / duration.as_secs() as f64).min(1.0)
+        if duration.as_secs_f64() > 0.0 {
+            (elapsed.as_secs_f64() / duration.as_secs_f64()).min(1.0)
         } else {
             0.0
         }
@@ -998,26 +1087,39 @@ fn ui(f: &mut Frame, player: &Player) {
         0.0
     };
 
-    let progress_label_text = if let Some(duration) = total {
-        format!(" {}/{} ", Player::format_duration(elapsed), Player::format_duration(duration))
+    let time_text = if let Some(duration) = total {
+        format!("{} / {}", Player::format_duration(elapsed), Player::format_duration(duration))
     } else {
-        format!(" {} ", Player::format_duration(elapsed))
+        Player::format_duration(elapsed)
     };
 
-    let progress_bar_style = Style::default().fg(PRIMARY_COLOR).bg(Color::default());
-    let progress_label = Span::styled(progress_label_text, progress_bar_style);
+    // Split progress area into [gauge | time]
+    let progress_block = Block::default()
+        .borders(Borders::ALL)
+        .title("Progress")
+        .border_style(Style::default().fg(PRIMARY_COLOR));
+    let progress_inner = progress_block.inner(chunks[2]);
+    f.render_widget(progress_block, chunks[2]);
 
-    let progress_bar = Gauge::default()
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Progress")
-                .border_style(Style::default().fg(PRIMARY_COLOR)),
-        )
+    let time_width = time_text.len() as u16 + 2; // padding
+    let progress_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Min(10),           // gauge fills remaining space
+            Constraint::Length(time_width), // fixed-width time display
+        ])
+        .split(progress_inner);
+
+    let progress_bar_style = Style::default().fg(PRIMARY_COLOR).bg(Color::default());
+    let gauge = Gauge::default()
         .gauge_style(progress_bar_style)
-        .ratio(progress_ratio)
-        .label(progress_label);
-    f.render_widget(progress_bar, chunks[2]);
+        .ratio(progress_ratio);
+    f.render_widget(gauge, progress_chunks[0]);
+
+    let time_label = Paragraph::new(time_text)
+        .style(Style::default().fg(PRIMARY_COLOR))
+        .alignment(Alignment::Right);
+    f.render_widget(time_label, progress_chunks[1]);
 
     // Status
     let mode_text = if player.random_mode { "RANDOM" } else { "NORMAL" };
@@ -1113,6 +1215,10 @@ fn ui(f: &mut Frame, player: &Player) {
             Line::from(vec![
                 Span::styled(" 0         ", Style::default().fg(PRIMARY_COLOR).add_modifier(Modifier::BOLD)),
                 Span::raw(" - Reset speed (1.0x)"),
+            ]),
+            Line::from(vec![
+                Span::styled(" 1-9       ", Style::default().fg(PRIMARY_COLOR).add_modifier(Modifier::BOLD)),
+                Span::raw(" - Jump to 10%-90% of song"),
             ]),
             Line::from(vec![
                 Span::styled(" q/Esc     ", Style::default().fg(PRIMARY_COLOR).add_modifier(Modifier::BOLD)),
@@ -1493,6 +1599,22 @@ fn main_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, player: &mut
                     }
 
                     KeyEvent {
+                        code: KeyCode::Char(c @ '1'..='9'),
+                        modifiers: KeyModifiers::NONE,
+                        ..
+                    } => {
+                        if player.search_mode {
+                            player.search_query.push(c);
+                            let query = player.search_query.clone();
+                            player.fuzzy_search(&query);
+                        } else {
+                            // 1-9 = seek to 10%-90% of song
+                            let pct = c.to_digit(10).unwrap();
+                            player.seek_to_percentage(pct);
+                        }
+                    }
+
+                    KeyEvent {
                         code: KeyCode::Char('?'),
                         modifiers: KeyModifiers::NONE,
                         ..
@@ -1577,6 +1699,7 @@ fn main_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, player: &mut
 
         // Check if stretch completed in background
         player.check_stretch_result();
+        player.check_next_chunk();
 
         // Check if current song/chunk finished
         if player.is_playing && player.stretch_rx.is_none() {
@@ -1586,18 +1709,37 @@ fn main_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, player: &mut
                     drop(sink);
 
                     let song_pos = player.current_song_position();
-                    let song_done = match player.song_duration {
-                        Some(dur) => song_pos >= dur,
-                        None => true,
+                    let song_done = if let Some(dur) = player.song_duration {
+                        song_pos >= dur
+                    } else if let Some(ref raw) = player.decoded_samples {
+                        // Fallback: check if we've consumed all samples
+                        let samples_per_sec =
+                            player.decoded_sample_rate as f64 * player.decoded_channels as f64;
+                        let total_secs = raw.len() as f64 / samples_per_sec;
+                        song_pos.as_secs_f64() >= total_secs
+                    } else {
+                        true
                     };
 
                     if player.playing_stretched && !song_done {
-                        // Stretched chunk ended but song continues — stretch next chunk
-                        player.seek_offset = song_pos;
-                        player.playback_start = None;
-                        player.playing_stretched = false;
-                        player.is_playing = false;
-                        player.spawn_stretch();
+                        // Stretched chunk ended but song continues
+                        player.seek_offset = player.chunk_end_pos;
+
+                        if let Some(next) = player.next_chunk.take() {
+                            // Pre-fetched chunk ready — seamless swap, no gap
+                            player.apply_stretched(next);
+                        } else {
+                            // Not ready yet — pause briefly and wait
+                            player.playback_start = None;
+                            player.playing_stretched = false;
+                            player.is_playing = false;
+                            if player.next_chunk_rx.is_some() {
+                                // Already being computed, promote to main stretch_rx
+                                player.stretch_rx = player.next_chunk_rx.take();
+                            } else {
+                                player.spawn_stretch();
+                            }
+                        }
                     } else {
                         // Song actually finished — play next
                         player.is_playing = false;
