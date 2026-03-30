@@ -48,9 +48,9 @@ cargo build --release
 2. **Navigate**: Use `j/k` or arrow keys to browse songs
 3. **Search**: Press `/` and type to find songs instantly
 4. **Play**: Press `Enter` or `Space` to play selected song
-5. **Speed up**: Press `+`/`-` to adjust playback speed
+5. **Speed up**: Press `+`/`-` to adjust playback speed, `0` to reset
 6. **Jump**: Use `gg` (first song) or `G` (last song)
-7. **Help**: Press `x` to see all controls
+7. **Help**: Press `?` to see all controls
 8. **Quit**: Press `q` or `Esc` to exit
 
 ### Music Files
@@ -67,7 +67,7 @@ musix
 
 ## Controls
 
-> **Tip**: Press **x** anytime to view the interactive controls popup!
+> **Tip**: Press **?** anytime to view the interactive controls popup!
 
 ### Essential Keys
 
@@ -75,7 +75,7 @@ musix
 |-----|--------|
 | **`Space/↵`** | **Smart Play** - Play selected song or pause current |
 | **`/`** | **Search Mode** - Enter fuzzy search |
-| **`x`** | **Show/Hide help popup** |
+| **`?`** | **Show/Hide help popup** |
 | **`q/Esc`** | **Exit** |
 
 ### Navigation & Playback
@@ -88,8 +88,10 @@ musix
 | `gg` / `G` | Jump to first/last song |
 | `,` / `.` | Seek backward/forward 5 seconds |
 | `<` / `>` | Same as above |
-| `+` / `-` | Increase/decrease playback speed (±0.1x) |
-| `=` | Reset speed to 1.0x |
+| `+` or `=` | Increase playback speed (+0.1x) |
+| `-` | Decrease playback speed (-0.1x) |
+| `0` | Reset speed to 1.0x |
+| `1`-`9` | Jump to 10%-90% of song |
 | `r` | Toggle Random mode |
 
 ### Search Mode
@@ -124,25 +126,27 @@ MUSIX features a clean, 4-panel interface that maximizes space for your music:
 └─────────────────────────────────┘
 ```
 
-### Interactive Controls Popup (Press **x**)
+### Interactive Controls Popup (Press **?**)
 
 ```
-┌─────────────────────────────────┐
-│            CONTROLS             │
-│                                 │
+┌──────────────────────────────────┐
+│            CONTROLS              │
+│                                  │
 │ ↑/↓ or j/k - Navigate songs     │
-│ Space/↵    - Play/Pause         │
+│ Space/↵    - Play/Pause          │
 │ ←/→ or h/l - Play prev/next song│
-│ gg/G       - Jump to first/last │
-│ /          - Enter search mode  │
-│ n/N        - Next/prev search   │
-│ ,/.        - Seek ±5 seconds    │
-│ +/-        - Speed up/down      │
-│ =          - Reset speed (1.0x) │
-│ r          - Toggle random mode │
-│ q/Esc      - Exit application   │
-│ x          - Close this popup   │
-└─────────────────────────────────┘
+│ gg/G       - Jump to first/last  │
+│ /          - Enter search mode   │
+│ n/N        - Next/prev search    │
+│ ,/.        - Seek ±5 seconds     │
+│ R          - Toggle random mode  │
+│ +/=        - Increase speed      │
+│ -          - Decrease speed      │
+│ 0          - Reset speed (1.0x)  │
+│ 1-9        - Jump to 10%-90%     │
+│ q/Esc      - Exit application    │
+│ ?          - Toggle this help    │
+└──────────────────────────────────┘
 ```
 
 ## Smart Features
@@ -160,7 +164,7 @@ MUSIX features a clean, 4-panel interface that maximizes space for your music:
 ### Playback Speed Control
 - **Pitch-Preserving**: Speed changes use a custom WSOLA algorithm — voice sounds natural at any speed
 - **Range**: 0.25x to 4.0x in 0.1x increments
-- **Quick Reset**: Press `=` to instantly return to normal speed
+- **Quick Reset**: Press `0` to instantly return to normal speed
 - **Status Display**: Current speed shown in the status bar (e.g., "Speed: 1.50x")
 
 ### Visual Indicators
@@ -206,7 +210,6 @@ MUSIX features a clean, 4-panel interface that maximizes space for your music:
 musix/
 ├── src/
 │   └── main.rs          # Complete application (~1600 lines)
-├── data/                # MP3 files (optional)
 ├── .github/workflows/   # CI/CD automation
 ├── Cargo.toml          # Dependencies and metadata
 ├── rustfmt.toml        # Code formatting rules
